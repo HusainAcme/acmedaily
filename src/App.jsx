@@ -59,6 +59,50 @@ function parseRSSXML(xmlText, src) {
   }).filter(a => a.title && a.link);
 }
 
+// Parse Anthropic HTML into a list of article objects
+function parseAnthropicHTML(htmlText, src) {
+  const articles = [];
+  const blockRegex = /<a[^>]*href="(\/news\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  let match;
+  while ((match = blockRegex.exec(htmlText)) !== null) {
+    if (articles.length >= 8) break;
+    const link = "https://www.anthropic.com" + match[1];
+    const innerHtml = match[2];
+
+    const titleMatch = innerHtml.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/);
+    const title = titleMatch ? stripHtml(titleMatch[1]) : "";
+
+    const dateMatch = innerHtml.match(/<time[^>]*>([\s\S]*?)<\/time>/);
+    const pubDate = dateMatch ? stripHtml(dateMatch[1]) : "";
+
+    const pMatch = innerHtml.match(/<p[^>]*class="[^"]*body[^"]*"[^>]*>([\s\S]*?)<\/p>/);
+    let desc = "";
+    if (pMatch) {
+      desc = stripHtml(pMatch[1]);
+    } else {
+      // fallback generic p tag
+      const fallbackP = innerHtml.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+      desc = fallbackP ? stripHtml(fallbackP[1]) : "";
+    }
+
+    if (title && link) {
+      articles.push({
+        id: (link || title) + src.id,
+        title,
+        desc,
+        link,
+        image: null,
+        imageLoading: !IMAGE_CACHE.has(link),
+        date: pubDate,
+        sourceId: src.id,
+        catId: src.cat,
+        source: src,
+      });
+    }
+  }
+  return articles;
+}
+
 // Fetch an RSS feed through a given proxy base URL.
 async function fetchViaProxy(proxyUrl, feedUrl) {
   const url = proxyUrl + encodeURIComponent(feedUrl);
@@ -92,9 +136,10 @@ const Favicon = ({ domain }) => (
 const SOURCES = [
   // AI & LLMs
   { id: "openai", cat: "ai", label: "OpenAI", short: "OAI", url: "https://openai.com/blog/rss.xml", color: "#10a37f", bg: "#e8f7f3", logo: <Favicon domain="openai.com" /> },
-  { id: "anthropic", cat: "ai", label: "Anthropic", short: "AC", url: "https://hnrss.org/newest?q=Anthropic", color: "#b05c2a", bg: "#f7ede5", logo: <Favicon domain="anthropic.com" /> },
+  { id: "anthropic", cat: "ai", label: "Anthropic", short: "AC", url: "https://www.anthropic.com/news", isHtml: true, color: "#b05c2a", bg: "#f7ede5", logo: <Favicon domain="anthropic.com" /> },
   { id: "vergeai", cat: "ai", label: "The Verge AI", short: "VG", url: "https://www.theverge.com/rss/index.xml", color: "#e5192b", bg: "#fdeaeb", logo: <Favicon domain="theverge.com" /> },
   { id: "tcai", cat: "ai", label: "TechCrunch AI", short: "TC", url: "https://techcrunch.com/category/artificial-intelligence/feed/", color: "#0a8f08", bg: "#e7f4e7", logo: <Favicon domain="techcrunch.com" /> },
+  { id: "nvidia", cat: "ai", label: "Nvidia", short: "NV", url: "https://blogs.nvidia.com/feed/", color: "#76b900", bg: "#eef7e6", logo: <Favicon domain="nvidia.com" /> },
   // Microsoft
   { id: "msai", cat: "microsoft", label: "Microsoft AI", short: "MS", url: "https://blogs.microsoft.com/ai/feed/", color: "#0078d4", bg: "#e5f2fc", logo: <Favicon domain="microsoft.com" /> },
   { id: "azure", cat: "microsoft", label: "Azure", short: "AZ", url: "https://azure.microsoft.com/en-us/blog/feed/", color: "#0089d6", bg: "#e5f2fc", logo: <Favicon domain="azure.microsoft.com" /> },
@@ -675,6 +720,9 @@ export default function TechHub() {
           }
         }
         try {
+          if (src.isHtml && src.id === "anthropic") {
+            return parseAnthropicHTML(xmlText, src);
+          }
           return parseRSSXML(xmlText, src);
         } catch {
           errs.push(src.label);
