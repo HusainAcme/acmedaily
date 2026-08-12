@@ -38,6 +38,9 @@ const SOURCE_BY_ID = Object.fromEntries(SOURCES.map(s => [s.id, s]));
 // Articles carry only a sourceId. If a feed is retired between a published
 // feeds.json and a deploy, render it neutrally rather than crashing on undefined.
 const UNKNOWN_SOURCE = { id: "unknown", label: "Unknown", cat: "all", color: "#6b7280", bg: "#f0f0f0", logo: null };
+
+// How urgently the week's themes need attention, set by the summary model.
+const IMPACT_LABEL = { act: "Act now", plan: "Plan", watch: "Watch" };
 const sourceOf = a => SOURCE_BY_ID[a.sourceId] ?? UNKNOWN_SOURCE;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,15 +232,48 @@ const styles = `
   }
   .wk-themes {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-    gap: 20px; border-top: 1px solid var(--rule); padding-top: 18px;
+    gap: 20px 24px; border-top: 1px solid var(--rule); padding-top: 18px;
+    /* start, not stretch: expanding one theme must not pad the others. */
+    align-items: start;
   }
   .wk-theme { min-width: 0; }
-  .wk-num {
-    font: 500 9px/1 var(--font-mono); color: var(--ms);
-    letter-spacing: 1px; margin-bottom: 7px; display: block;
+
+  /* Chip row: impact first, then the number that anchors the theme. */
+  .wk-chips { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+  .wk-impact {
+    font: 600 8px/1 var(--font-mono); letter-spacing: 1px; text-transform: uppercase;
+    padding: 3px 6px; border-radius: 3px; border: 1px solid;
   }
-  .wk-theme-title { font: 700 14px/1.35 var(--font-serif); color: var(--ink); margin-bottom: 7px; }
-  .wk-theme-sum { font: 300 11.5px/1.6 var(--font-sans); color: var(--muted); margin-bottom: 10px; }
+  .wk-impact.act   { color: #b91c1c; border-color: #f3c4c4; background: #fdeaea; }
+  .wk-impact.plan  { color: #92620a; border-color: #f6d860; background: #fff8e1; }
+  .wk-impact.watch { color: var(--muted); border-color: var(--rule); background: var(--light); }
+  .wk-stat {
+    font: 500 10px/1 var(--font-mono); color: var(--ink);
+    padding: 3px 6px; border-radius: 3px; background: var(--light); border: 1px solid var(--rule);
+  }
+  .wk-num { font: 500 9px/1 var(--font-mono); color: var(--muted); letter-spacing: 1px; margin-left: auto; }
+
+  .wk-theme-title { font: 700 14px/1.35 var(--font-serif); color: var(--ink); margin-bottom: 6px; }
+  /* The takeaway is the line most people read, so it gets body weight and
+     ink colour rather than the muted treatment used for supporting text. */
+  .wk-take { font: 400 12px/1.55 var(--font-sans); color: var(--ink2); }
+
+  .wk-det { margin-top: 9px; }
+  .wk-det > summary {
+    font: 600 8.5px/1 var(--font-mono); letter-spacing: 1px; text-transform: uppercase;
+    color: var(--ms); cursor: pointer; list-style: none;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 5px 0; border-top: 1px solid var(--rule);
+  }
+  .wk-det > summary::-webkit-details-marker { display: none; }
+  .wk-det > summary::marker { content: ""; }
+  .wk-det > summary:hover { color: var(--ink); }
+  .wk-det > summary:focus-visible { outline: 2px solid var(--ms); outline-offset: 2px; }
+  .wk-caret { transition: transform 0.15s; display: inline-block; }
+  .wk-det[open] .wk-caret { transform: rotate(180deg); }
+  .wk-srccount { color: var(--muted); font-weight: 400; letter-spacing: .5px; }
+  .wk-detail-body { font: 300 11.5px/1.6 var(--font-sans); color: var(--muted); padding: 4px 0 10px; }
+
   .wk-links { display: flex; flex-direction: column; gap: 5px; }
   .wk-link {
     font: 400 10px/1.4 var(--font-sans); color: var(--ink2); text-decoration: none;
@@ -934,30 +970,57 @@ export default function TechHub() {
 
               {weekly.themes?.length > 0 && (
                 <div className="wk-themes">
-                  {weekly.themes.map((t, i) => (
-                    <div key={i} className="wk-theme">
-                      <span className="wk-num">{String(i + 1).padStart(2, "0")}</span>
-                      <div className="wk-theme-title">{t.title}</div>
-                      <div className="wk-theme-sum">{t.summary}</div>
-                      <div className="wk-links">
-                        {(t.articles || []).map(a => {
-                          const src = SOURCE_BY_ID[a.sourceId] ?? UNKNOWN_SOURCE;
-                          return (
-                            <a
-                              key={a.link}
-                              className="wk-link"
-                              href={a.link}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                            >
-                              <span className="wk-link-dot" style={{ background: src.color }} />
-                              <span className="wk-link-title">{a.title}</span>
-                            </a>
-                          );
-                        })}
+                  {weekly.themes.map((t, i) => {
+                    // `summary` is the pre-v2 field name; fall back so an older
+                    // cached payload still renders rather than showing blanks.
+                    const takeaway = t.takeaway ?? t.summary ?? "";
+                    const detail = t.detail ?? "";
+                    const impact = ["act", "plan", "watch"].includes(t.impact) ? t.impact : "watch";
+                    const links = t.articles || [];
+                    return (
+                      <div key={i} className="wk-theme">
+                        <div className="wk-chips">
+                          <span className={`wk-impact ${impact}`}>{IMPACT_LABEL[impact]}</span>
+                          {t.stat && <span className="wk-stat">{t.stat}</span>}
+                          <span className="wk-num">{String(i + 1).padStart(2, "0")}</span>
+                        </div>
+
+                        <div className="wk-theme-title">{t.title}</div>
+                        <div className="wk-take">{takeaway}</div>
+
+                        {(detail || links.length > 0) && (
+                          <details className="wk-det">
+                            <summary>
+                              <span>
+                                <span className="wk-caret">⌄</span> More
+                              </span>
+                              <span className="wk-srccount">
+                                {links.length} {links.length === 1 ? "source" : "sources"}
+                              </span>
+                            </summary>
+                            {detail && <div className="wk-detail-body">{detail}</div>}
+                            <div className="wk-links">
+                              {links.map(a => {
+                                const src = SOURCE_BY_ID[a.sourceId] ?? UNKNOWN_SOURCE;
+                                return (
+                                  <a
+                                    key={a.link}
+                                    className="wk-link"
+                                    href={a.link}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                  >
+                                    <span className="wk-link-dot" style={{ background: src.color }} />
+                                    <span className="wk-link-title">{a.title}</span>
+                                  </a>
+                                );
+                              })}
+                            </div>
+                          </details>
+                        )}
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>

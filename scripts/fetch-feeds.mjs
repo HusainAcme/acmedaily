@@ -16,6 +16,7 @@ import {
   generateWeeklySummary,
   buildSampleSummary,
   summaryIsFresh,
+  hasUsableKey,
 } from "./weekly-summary.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -424,9 +425,9 @@ async function main() {
     }
     // Only stand in a sample when no key exists at all, so a real failure is
     // never disguised as placeholder content.
-    if (!weekly && !process.env.ANTHROPIC_API_KEY) {
+    if (!weekly && !hasUsableKey()) {
       weekly = buildSampleSummary(archive, { now, sourceLabels });
-      if (weekly) console.log("  weekly: wrote sample placeholder (no API key configured)");
+      if (weekly) console.log("  weekly: wrote sample placeholder (no usable API key)");
     }
   }
 
