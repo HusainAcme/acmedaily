@@ -22,3 +22,14 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Scraped og:image results, carried between CI runs via actions/cache
+.cache/
+
+# Local secrets — never commit these, this repo is public
+.env
+.env.*
+!.env.example
+
+# Claude Code local machine settings
+.claude/settings.local.json

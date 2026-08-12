@@ -1,127 +1,25 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import {
+  CATEGORIES,
+  SOURCES as SOURCE_DATA,
+  REFRESH_INTERVAL_MINUTES,
+  STALE_AFTER_MINUTES,
+} from "./sources.js";
 
-const CODETABS = "https://api.codetabs.com/v1/proxy?quest=";
-const CORSPROXY = "https://corsproxy.io/?";
-const THINGPROXY = "https://thingproxy.freeboard.io/fetch/";
+// Feeds are gathered server-side by scripts/fetch-feeds.mjs on a schedule and
+// published as a static file, so there is no CORS proxy in the request path.
+const FEEDS_URL = `${import.meta.env.BASE_URL}feeds.json`;
 
-// Parse raw RSS/Atom XML into a list of article objects
-function parseRSSXML(xmlText, src) {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(xmlText, "text/xml");
-  const items = Array.from(doc.querySelectorAll("item, entry")).slice(0, 8);
-  return items.map(item => {
-    const getText = tag => item.getElementsByTagName(tag)[0]?.textContent?.trim() || "";
-    const title = getText("title");
-    const link =
-      item.getElementsByTagName("link")[0]?.getAttribute("href") ||
-      getText("link");
-    const description = getText("description") || getText("summary") || getText("content");
-    const pubDate = getText("pubDate") || getText("published") || getText("updated");
+// Corporate logo, served from public/ so the path survives the /acmedaily/ base.
+const LOGO_URL = `${import.meta.env.BASE_URL}acmelogo.png`;
 
-    // Image: try media:content, enclosure, itunes:image, og:image encoded in content
-    const mediaContent = item.getElementsByTagNameNS("http://search.yahoo.com/mrss/", "content")[0];
-    const enclosure = item.getElementsByTagName("enclosure")[0];
-    const itunesImage = item.getElementsByTagNameNS("http://www.itunes.com/dtds/podcast-1.0.dtd", "image")[0];
-    let image =
-      mediaContent?.getAttribute("url") ||
-      enclosure?.getAttribute("url") ||
-      itunesImage?.getAttribute("href") ||
-      null;
+// How often an open tab re-checks the published file for a newer build.
+const POLL_INTERVAL_MS = 5 * 60 * 1000;
+// Ignore a focus-triggered re-check if we already looked this recently.
+const FOCUS_RECHECK_AFTER_MS = 60 * 1000;
+// Cadence for re-rendering relative timestamps ("32m ago") so they stay true.
+const CLOCK_TICK_MS = 30 * 1000;
 
-    if (!image) {
-      // Sometimes images are just inside a <media:thumbnail> tag without namespace prefix working well
-      const thumbnail = item.getElementsByTagName("media:thumbnail")[0];
-      if (thumbnail) image = thumbnail.getAttribute("url");
-    }
-
-    if (!image && description) {
-      // try extracting img src from description html
-      const imgMatch = description.match(/<img[^>]+src=["']([^"']+)["']/i);
-      if (imgMatch) image = imgMatch[1];
-    }
-
-    if (!image && IMAGE_CACHE.has(link)) {
-      image = IMAGE_CACHE.get(link);
-    }
-
-    return {
-      id: (link || title) + src.id,
-      title: title.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#8217;/g, "'").replace(/&#8220;/g, '"').replace(/&#8221;/g, '"'),
-      desc: stripHtml(description),
-      link,
-      image,
-      imageLoading: !image && !IMAGE_CACHE.has(link),
-      date: pubDate,
-      sourceId: src.id,
-      catId: src.cat,
-      source: src,
-    };
-  }).filter(a => a.title && a.link);
-}
-
-// Parse Anthropic HTML into a list of article objects
-function parseAnthropicHTML(htmlText, src) {
-  const articles = [];
-  const blockRegex = /<a[^>]*href="(\/news\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-  let match;
-  while ((match = blockRegex.exec(htmlText)) !== null) {
-    if (articles.length >= 8) break;
-    const link = "https://www.anthropic.com" + match[1];
-    const innerHtml = match[2];
-
-    const titleMatch = innerHtml.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/);
-    const title = titleMatch ? stripHtml(titleMatch[1]) : "";
-
-    const dateMatch = innerHtml.match(/<time[^>]*>([\s\S]*?)<\/time>/);
-    const pubDate = dateMatch ? stripHtml(dateMatch[1]) : "";
-
-    const pMatch = innerHtml.match(/<p[^>]*class="[^"]*body[^"]*"[^>]*>([\s\S]*?)<\/p>/);
-    let desc = "";
-    if (pMatch) {
-      desc = stripHtml(pMatch[1]);
-    } else {
-      // fallback generic p tag
-      const fallbackP = innerHtml.match(/<p[^>]*>([\s\S]*?)<\/p>/);
-      desc = fallbackP ? stripHtml(fallbackP[1]) : "";
-    }
-
-    if (title && link) {
-      articles.push({
-        id: (link || title) + src.id,
-        title,
-        desc,
-        link,
-        image: null,
-        imageLoading: !IMAGE_CACHE.has(link),
-        date: pubDate,
-        sourceId: src.id,
-        catId: src.cat,
-        source: src,
-      });
-    }
-  }
-  return articles;
-}
-
-// Fetch an RSS feed through a given proxy base URL.
-async function fetchViaProxy(proxyUrl, feedUrl) {
-  const url = proxyUrl + encodeURIComponent(feedUrl);
-  const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return await r.text();
-}
-
-
-// ── CATEGORIES ──────────────────────────────────────────────────────────────
-const CATEGORIES = [
-  { id: "all", label: "All News", icon: "📰", color: "#0d0d0d" },
-  { id: "ai", label: "AI & LLMs", icon: "🤖", color: "#10a37f" },
-  { id: "microsoft", label: "Microsoft", icon: "⊞", color: "#0078d4" },
-  { id: "cloud", label: "Cloud", icon: "☁", color: "#ff9900" },
-  { id: "devops", label: "DevOps", icon: "⚙", color: "#ff6b35" },
-  { id: "enterprise", label: "Enterprise", icon: "🏢", color: "#607d8b" },
-  { id: "security", label: "Security", icon: "🔐", color: "#cc0000" },
-];
 
 // ── FAVICON HELPER ───────────────────────────────────────────────────────────
 const Favicon = ({ domain }) => (
@@ -132,88 +30,15 @@ const Favicon = ({ domain }) => (
   />
 );
 
-// ── SOURCES ──────────────────────────────────────────────────────────────────
-const SOURCES = [
-  // AI & LLMs
-  { id: "openai", cat: "ai", label: "OpenAI", short: "OAI", url: "https://openai.com/blog/rss.xml", color: "#10a37f", bg: "#e8f7f3", logo: <Favicon domain="openai.com" /> },
-  { id: "anthropic", cat: "ai", label: "Anthropic", short: "AC", url: "https://www.anthropic.com/news", isHtml: true, color: "#b05c2a", bg: "#f7ede5", logo: <Favicon domain="anthropic.com" /> },
-  { id: "vergeai", cat: "ai", label: "The Verge AI", short: "VG", url: "https://www.theverge.com/rss/index.xml", color: "#e5192b", bg: "#fdeaeb", logo: <Favicon domain="theverge.com" /> },
-  { id: "tcai", cat: "ai", label: "TechCrunch AI", short: "TC", url: "https://techcrunch.com/category/artificial-intelligence/feed/", color: "#0a8f08", bg: "#e7f4e7", logo: <Favicon domain="techcrunch.com" /> },
-  { id: "nvidia", cat: "ai", label: "Nvidia", short: "NV", url: "https://blogs.nvidia.com/feed/", color: "#76b900", bg: "#eef7e6", logo: <Favicon domain="nvidia.com" /> },
-  // Microsoft
-  { id: "msai", cat: "microsoft", label: "Microsoft AI", short: "MS", url: "https://blogs.microsoft.com/ai/feed/", color: "#0078d4", bg: "#e5f2fc", logo: <Favicon domain="microsoft.com" /> },
-  { id: "azure", cat: "microsoft", label: "Azure", short: "AZ", url: "https://azure.microsoft.com/en-us/blog/feed/", color: "#0089d6", bg: "#e5f2fc", logo: <Favicon domain="azure.microsoft.com" /> },
-  { id: "github", cat: "microsoft", label: "GitHub", short: "GH", url: "https://github.blog/all.atom", color: "#24292f", bg: "#f0f0f0", logo: <Favicon domain="github.com" /> },
-  { id: "m365", cat: "microsoft", label: "M365 / Copilot", short: "M3", url: "https://www.microsoft.com/en-us/microsoft-365/blog/feed/", color: "#5c2d91", bg: "#f0eaf8", logo: <Favicon domain="microsoft.com" /> },
-  // Cloud
-  { id: "aws", cat: "cloud", label: "AWS", short: "AWS", url: "https://aws.amazon.com/blogs/aws/feed/", color: "#ff9900", bg: "#fff5e5", logo: <Favicon domain="aws.amazon.com" /> },
-  { id: "gcloud", cat: "cloud", label: "Google Cloud", short: "GC", url: "https://feeds.feedburner.com/GoogleCloudPlatformBlog", color: "#4285f4", bg: "#eaf1ff", logo: <Favicon domain="cloud.google.com" /> },
-  { id: "awssec", cat: "cloud", label: "AWS Security", short: "AWSs", url: "https://aws.amazon.com/blogs/security/feed/", color: "#e8691c", bg: "#fff0e8", logo: <Favicon domain="aws.amazon.com" /> },
-  // DevOps
-  { id: "devopsdotcom", cat: "devops", label: "DevOps.com", short: "DO", url: "https://devops.com/feed/", color: "#ff6b35", bg: "#fff0ea", logo: <Favicon domain="devops.com" /> },
-  { id: "thenewstack", cat: "devops", label: "The New Stack", short: "NS", url: "https://thenewstack.io/feed/", color: "#1a1a2e", bg: "#eaeaf3", logo: <Favicon domain="thenewstack.io" /> },
-  { id: "docker", cat: "devops", label: "Docker", short: "DK", url: "https://www.docker.com/blog/feed/", color: "#2496ed", bg: "#e8f3fc", logo: <Favicon domain="docker.com" /> },
-  { id: "redhat", cat: "devops", label: "Red Hat", short: "RH", url: "https://www.redhat.com/en/rss/blog", color: "#cc0000", bg: "#fdeaea", logo: <Favicon domain="redhat.com" /> },
-  // Enterprise
-  { id: "cisco", cat: "enterprise", label: "Cisco", short: "CS", url: "https://blogs.cisco.com/feed", color: "#049fd9", bg: "#e5f6fd", logo: <Favicon domain="cisco.com" /> },
-  { id: "adobe", cat: "enterprise", label: "Adobe", short: "AD", url: "https://blog.adobe.com/en/publish/feed.xml", color: "#fa0f00", bg: "#fde8e8", logo: <Favicon domain="adobe.com" /> },
-  { id: "hpe", cat: "enterprise", label: "HPE", short: "HP", url: "https://hnrss.org/newest?q=Hewlett+Packard+Enterprise", color: "#01a982", bg: "#e5f7f3", logo: <Favicon domain="hpe.com" /> },
-  { id: "veeam", cat: "enterprise", label: "Veeam", short: "VM", url: "https://www.veeam.com/blog/feed/", color: "#007db8", bg: "#e5f2f9", logo: <Favicon domain="veeam.com" /> },
-  // Security
-  { id: "paloalto", cat: "security", label: "Palo Alto", short: "PA", url: "https://www.paloaltonetworks.com/blog/feed/", color: "#fa582d", bg: "#fff0eb", logo: <Favicon domain="paloaltonetworks.com" /> },
-  { id: "fortinet", cat: "security", label: "Fortinet", short: "FT", url: "https://www.fortinet.com/blog/rss.xml", color: "#ee3124", bg: "#fdecea", logo: <Favicon domain="fortinet.com" /> },
-  { id: "krebs", cat: "security", label: "Krebs on Security", short: "KB", url: "https://krebsonsecurity.com/feed/", color: "#333", bg: "#f0f0f0", logo: <Favicon domain="krebsonsecurity.com" /> },
-];
+// The source list itself lives in sources.js so the Node prefetch script can
+// import it too; the logo element is the one browser-only part, added here.
+const SOURCES = SOURCE_DATA.map(s => ({ ...s, logo: <Favicon domain={s.domain} /> }));
+const SOURCE_BY_ID = Object.fromEntries(SOURCES.map(s => [s.id, s]));
 
-const POWER_FEATURES = [
-  { id: "teams", icon: "💬", color: "#6264a7", bg: "#eef0f9", label: "Teams Alerts", desc: "Auto-post breaking news to your channel", badge: "Power Automate" },
-  { id: "powerbi", icon: "📊", color: "#f2c811", bg: "#fef9e7", label: "Trends Dashboard", desc: "Live topic & source analytics in Power BI", badge: "Power BI" },
-  { id: "powerapps", icon: "📌", color: "#742774", bg: "#f5ecf5", label: "Bookmarks", desc: "Tag & save articles via Power Apps", badge: "Power Apps" },
-  { id: "digest", icon: "📧", color: "#0066ff", bg: "#e8f0ff", label: "Weekly Digest", desc: "Auto-email digest to department heads", badge: "Power Automate" },
-];
-
-// ── IMAGE FETCH QUEUE ────────────────────────────────────────────────────────
-const IMAGE_CACHE = new Map();
-const FETCH_QUEUE = [];
-let isQueueRunning = false;
-
-async function processImageCacheQueue(onUpdate) {
-  if (isQueueRunning) return;
-  isQueueRunning = true;
-
-  while (FETCH_QUEUE.length > 0) {
-    const batch = FETCH_QUEUE.splice(0, 5);
-    await Promise.all(batch.map(async (item) => {
-      const { id, link } = item;
-      try {
-        const proxyUrl = CODETABS + encodeURIComponent(link);
-        const r = await fetch(proxyUrl, { signal: AbortSignal.timeout(5000) });
-        if (!r.ok) throw new Error("fetch failed");
-        const html = await r.text();
-
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(html, "text/html");
-
-        let img = doc.querySelector('meta[property="og:image"]')?.getAttribute('content') ||
-          doc.querySelector('meta[name="twitter:image"]')?.getAttribute('content') ||
-          doc.querySelector('article img, .post-thumbnail img, .featured-image img')?.getAttribute('src');
-
-        if (img && img.startsWith('/')) {
-          const urlObj = new URL(link);
-          img = urlObj.origin + img;
-        }
-
-        IMAGE_CACHE.set(link, img || null);
-        onUpdate(id, img || null);
-      } catch (e) {
-        IMAGE_CACHE.set(link, null);
-        onUpdate(id, null);
-      }
-    }));
-  }
-
-  isQueueRunning = false;
-}
+// Articles carry only a sourceId. If a feed is retired between a published
+// feeds.json and a deploy, render it neutrally rather than crashing on undefined.
+const UNKNOWN_SOURCE = { id: "unknown", label: "Unknown", cat: "all", color: "#6b7280", bg: "#f0f0f0", logo: null };
+const sourceOf = a => SOURCE_BY_ID[a.sourceId] ?? UNKNOWN_SOURCE;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -228,6 +53,7 @@ const styles = `
     --muted: #6b7280;
     --light: #f5f3ef;
     --white: #ffffff;
+    --paper: #faf8f4;
     --rule:  #e2ddd6;
     --ms:    #0078d4;
     --font-serif: 'Playfair Display', Georgia, serif;
@@ -240,23 +66,28 @@ const styles = `
 
   /* ── MASTHEAD ─────────────────────────────────────────── */
   .masthead {
-    background: var(--ink); color: #fff;
-    padding: 16px 24px 12px; text-align: center;
+    background: var(--paper); color: var(--ink);
+    padding: 18px 24px 16px;
     border-bottom: 4px solid var(--ms);
   }
+  .masthead-inner { max-width: 1280px; margin: 0 auto; }
   .masthead-eye {
     font: 500 9px/1 var(--font-mono); letter-spacing: 3px;
-    text-transform: uppercase; color: rgba(255,255,255,0.35); margin-bottom: 8px;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 14px;
   }
+  /* Corporate mark on the left, publication name on the right. */
+  .masthead-lockup { display: flex; align-items: center; gap: 22px; }
+  .masthead-logo { height: 54px; width: auto; flex-shrink: 0; display: block; }
+  .masthead-rule { width: 1px; align-self: stretch; background: var(--rule); flex-shrink: 0; }
+  .masthead-text { min-width: 0; }
   .masthead-title {
-    font: 900 clamp(24px,5vw,58px)/1 var(--font-serif); letter-spacing: -1px;
+    font: 900 clamp(24px,4.4vw,46px)/1 var(--font-serif); letter-spacing: -1px; color: var(--ink);
   }
   .masthead-title em { font-style: italic; color: var(--ms); }
-  .masthead-divider {
-    display: flex; align-items: center; gap: 16px; margin-top: 8px; justify-content: center;
+  .masthead-sub {
+    font: 400 9px/1 var(--font-mono); letter-spacing: 2px;
+    color: var(--muted); text-transform: uppercase; margin-top: 9px;
   }
-  .masthead-line { flex: 1; max-width: 100px; height: 1px; background: rgba(255,255,255,0.12); }
-  .masthead-sub { font: 400 9px/1 var(--font-mono); letter-spacing: 2px; color: rgba(255,255,255,0.3); text-transform: uppercase; }
 
   /* ── PARTNER LOGOS BAR ──────────────────────────────────── */
   .partner-bar {
@@ -315,8 +146,39 @@ const styles = `
   }
   .cat-tab.active .cat-count { color: #fff; }
 
-  .nav-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .nav-actions {
+    display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+    padding-left: 16px; margin-left: 8px; border-left: 1px solid var(--rule);
+  }
   .date-stamp { font: 400 9px/1 var(--font-mono); color: var(--muted); letter-spacing: 0.5px; white-space: nowrap; }
+
+  /* ── FRESHNESS ──────────────────────────────────────────── */
+  .fresh {
+    display: flex; flex-direction: column; align-items: flex-end; gap: 3px;
+    white-space: nowrap; line-height: 1;
+    /* Capped so an unusually long readout can never squeeze out the tabs. */
+    max-width: 160px; overflow: hidden;
+  }
+  .fresh-main {
+    font: 500 9px/1 var(--font-mono); letter-spacing: 0.5px; text-transform: uppercase;
+    color: var(--ink2); display: flex; align-items: center; gap: 5px;
+  }
+  .fresh-next { font: 400 8px/1 var(--font-mono); letter-spacing: 0.5px; text-transform: uppercase; color: var(--muted); }
+  .fresh-pip {
+    width: 6px; height: 6px; border-radius: 50%; background: #22c55e;
+    box-shadow: 0 0 5px #22c55e; flex-shrink: 0;
+  }
+  .fresh.is-checking .fresh-pip { animation: blink 1s infinite; }
+  .fresh.is-stale .fresh-main { color: #92620a; }
+  .fresh.is-stale .fresh-pip { background: #f59e0b; box-shadow: 0 0 5px #f59e0b; }
+  .fresh.is-error .fresh-main { color: #b91c1c; }
+  .fresh.is-error .fresh-pip { background: #ef4444; box-shadow: 0 0 5px #ef4444; animation: none; }
+  .fresh-flash {
+    color: #0a8f08; font: 600 8px/1 var(--font-mono); letter-spacing: 1px; text-transform: uppercase;
+    animation: fadeflash 2.5s ease forwards;
+  }
+  @keyframes fadeflash { 0% { opacity: 0; } 12% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0; } }
+
   .refresh-btn {
     background: var(--ink); color: #fff; border: none; padding: 7px 14px; border-radius: 2px;
     font: 600 8px/1 var(--font-mono); letter-spacing: 1.5px; text-transform: uppercase;
@@ -339,22 +201,54 @@ const styles = `
   .t-item { font: 400 11px/1 var(--font-sans); color: #fff; opacity: 0.9; display: flex; align-items: center; gap: 8px; }
   .t-sep { opacity: 0.3; font-size: 8px; }
 
-  /* ── POWER PLATFORM BANNER ──────────────────────────────── */
-  .pp-banner { background: var(--ink); }
-  .pp-inner { max-width: 1280px; margin: 0 auto; display: grid; grid-template-columns: repeat(4,1fr); }
-  .pp-card {
-    padding: 14px 18px; border-right: 1px solid rgba(255,255,255,0.07);
-    display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
-    transition: background 0.15s;
+  /* ── AI WEEKLY REVIEW ───────────────────────────────────── */
+  .wk { background: var(--white); border-bottom: 1px solid var(--rule); }
+  .wk-inner { max-width: 1280px; margin: 0 auto; padding: 22px 24px 24px; }
+  .wk-top {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; margin-bottom: 12px;
   }
-  .pp-card:last-child { border-right: none; }
-  .pp-card:hover { background: rgba(255,255,255,0.04); }
-  .pp-icon { width: 34px; height: 34px; border-radius: 6px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 15px; }
-  .pp-body {}
-  .pp-badge { font: 500 7px/1 var(--font-mono); letter-spacing: 1px; text-transform: uppercase; color: rgba(255,255,255,0.3); margin-bottom: 4px; }
-  .pp-label { font: 600 12px/1 var(--font-sans); color: #fff; margin-bottom: 3px; }
-  .pp-desc { font: 300 10px/1.5 var(--font-sans); color: rgba(255,255,255,0.4); }
-  .pp-action { font: 600 8px/1 var(--font-mono); letter-spacing: 1px; text-transform: uppercase; margin-top: 7px; display: inline-flex; align-items: center; gap: 3px; }
+  .wk-eyebrow {
+    font: 600 9px/1 var(--font-mono); letter-spacing: 2.5px; text-transform: uppercase;
+    color: var(--ms); display: flex; align-items: center; gap: 8px;
+  }
+  .wk-spark { font-size: 11px; }
+  .wk-meta { font: 400 9px/1 var(--font-mono); color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .wk-sample {
+    font: 600 8px/1 var(--font-mono); letter-spacing: 1px; text-transform: uppercase;
+    background: #fff8e1; border: 1px solid #f6d860; color: #856404;
+    padding: 3px 7px; border-radius: 3px;
+  }
+  .wk-headline {
+    font: 900 clamp(19px,2.4vw,27px)/1.25 var(--font-serif);
+    letter-spacing: -0.4px; color: var(--ink); margin-bottom: 8px; max-width: 46ch;
+  }
+  .wk-intro {
+    font: 300 13px/1.65 var(--font-sans); color: var(--ink2);
+    max-width: 72ch; margin-bottom: 20px;
+  }
+  .wk-themes {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 20px; border-top: 1px solid var(--rule); padding-top: 18px;
+  }
+  .wk-theme { min-width: 0; }
+  .wk-num {
+    font: 500 9px/1 var(--font-mono); color: var(--ms);
+    letter-spacing: 1px; margin-bottom: 7px; display: block;
+  }
+  .wk-theme-title { font: 700 14px/1.35 var(--font-serif); color: var(--ink); margin-bottom: 7px; }
+  .wk-theme-sum { font: 300 11.5px/1.6 var(--font-sans); color: var(--muted); margin-bottom: 10px; }
+  .wk-links { display: flex; flex-direction: column; gap: 5px; }
+  .wk-link {
+    font: 400 10px/1.4 var(--font-sans); color: var(--ink2); text-decoration: none;
+    display: flex; gap: 6px; align-items: baseline; transition: color 0.15s;
+  }
+  .wk-link:hover { color: var(--ms); }
+  .wk-link-dot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; transform: translateY(-1px); }
+  .wk-link-title {
+    overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+    -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
 
   /* ── PAGE LAYOUT ────────────────────────────────────────── */
   .page { max-width: 1280px; margin: 0 auto; padding: 0 24px; }
@@ -527,8 +421,7 @@ const styles = `
   @media (max-width: 1200px) and (min-width: 768px) {
     .shell { grid-template-columns: 1fr; }
     .sidebar { display: none; }
-    .pp-inner { grid-template-columns: 1fr 1fr; }
-    .pp-card { border-bottom: 1px solid rgba(255,255,255,0.07); }
+    .wk-inner { padding: 20px 20px 22px; }
     .art-grid { grid-template-columns: repeat(2, 1fr); }
     /* Partner bar: allow horizontal scroll, but items still fit in a bar */
     .partner-bar-inner { min-width: max-content; }
@@ -540,8 +433,12 @@ const styles = `
 
   /* Mobile: < 768px */
   @media (max-width: 767px) {
-    /* Masthead */
-    .masthead { padding: 12px 12px 10px; }
+    /* Masthead: the side-by-side lockup stacks and centres. */
+    .masthead { padding: 14px 12px 12px; text-align: center; }
+    .masthead-eye { margin-bottom: 10px; }
+    .masthead-lockup { flex-direction: column; gap: 12px; }
+    .masthead-logo { height: 42px; margin: 0 auto; }
+    .masthead-rule { width: 56px; height: 1px; align-self: center; }
     .masthead-title { font-size: clamp(22px, 8vw, 36px); letter-spacing: -0.5px; }
     .masthead-sub { font-size: 8px; letter-spacing: 1px; }
 
@@ -558,18 +455,22 @@ const styles = `
 
     /* Category tabs: horizontal scroll, no scrollbar */
     .cat-nav-inner { padding: 0 8px; gap: 4px; }
+    .nav-actions { gap: 8px; padding-left: 8px; margin-left: 4px; }
     .cat-tabs { overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
     .cat-tabs::-webkit-scrollbar { display: none; }
     .cat-tab { padding: 0 10px; font-size: 9px; }
+    /* The full date goes, but the freshness readout stays — knowing how old
+       the data is matters more on mobile, not less. */
     .date-stamp { display: none; }
+    .fresh-main { font-size: 8px; gap: 4px; }
+    .fresh-next { font-size: 7px; }
+    .refresh-btn { padding: 7px 10px; }
+    .refresh-btn .refresh-label { display: none; }
 
-    /* Power Platform banner: 1 column */
-    .pp-inner {
-      grid-template-columns: 1fr;
-      /* Force all 4 cards to stack */
-    }
-    .pp-card { border-right: none; border-bottom: 1px solid rgba(255,255,255,0.07); }
-    .pp-card:last-child { border-bottom: none; }
+    /* Weekly review: single column, tighter */
+    .wk-inner { padding: 16px 12px 18px; }
+    .wk-themes { grid-template-columns: 1fr; gap: 18px; }
+    .wk-intro { margin-bottom: 16px; }
 
   /* Article grid: 1 column */
     .art-grid { grid-template-columns: 1fr; }
@@ -586,20 +487,52 @@ const styles = `
     /* Issue bar */
     .issue-bar { flex-direction: column; align-items: flex-start; gap: 4px; padding: 8px 12px; }
   }
+
+  @media (prefers-reduced-motion: reduce) {
+    .fresh-pip, .fresh-flash { animation: none !important; }
+    .fresh-flash { opacity: 1; }
+  }
 `;
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
-function timeAgo(dateStr) {
+// `now` is threaded in from a ticking clock so these labels stay accurate on a
+// tab that has been open for hours, instead of freezing at render time.
+function timeAgo(dateStr, now = Date.now()) {
+  if (!dateStr) return "";
   const d = new Date(dateStr);
   if (isNaN(d)) return "";
-  const s = (Date.now() - d) / 1000;
+  const s = (now - d) / 1000;
   if (s < 60) return "just now";
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return `${Math.floor(s / 86400)}d ago`;
 }
-function stripHtml(h = "") {
-  return h.replace(/<[^>]+>/g, "").replace(/&[^;]+;/g, " ").replace(/\s+/g, " ").trim();
+
+// Local wall-clock time of the refresh, e.g. "14:32".
+function formatClock(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+// Date range the weekly review covers, e.g. "5 Aug – 12 Aug".
+function weekPeriod(w) {
+  const fmt = d => {
+    const date = new Date(d);
+    return isNaN(date) ? "" : date.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  };
+  const from = fmt(w.periodStart);
+  const to = fmt(w.periodEnd);
+  return from && to ? `${from} – ${to}` : "";
+}
+
+// Compact duration for the countdown and the staleness readout: "18m", "2h 05m".
+function formatDuration(ms) {
+  const total = Math.max(0, Math.round(ms / 60000));
+  if (total < 60) return `${total}m`;
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return `${h}h ${String(m).padStart(2, "0")}m`;
 }
 
 // ── MS RESOURCES ──────────────────────────────────────────────────────────────
@@ -612,14 +545,17 @@ const MS_RES = [
 ];
 
 // ── SIDEBAR ───────────────────────────────────────────────────────────────────
-function Sidebar({ articles, activeCat }) {
+function Sidebar({ articles }) {
   const cats = CATEGORIES.filter(c => c.id !== "all");
   const maxCat = Math.max(...cats.map(c => articles.filter(a => a.catId === c.id).length), 1);
 
-  const topSources = useMemo(() =>
-    SOURCES.map(s => ({ ...s, count: articles.filter(a => a.sourceId === s.id).length }))
-      .filter(s => s.count > 0).sort((a, b) => b.count - a.count).slice(0, 12),
-    [articles]);
+  // No useMemo here: React Compiler cannot preserve a manual memo around this
+  // expression, and it auto-memoizes the plain version anyway.
+  const topSources = SOURCES
+    .map(s => ({ ...s, count: articles.filter(a => a.sourceId === s.id).length }))
+    .filter(s => s.count > 0)
+    .toSorted((a, b) => b.count - a.count)
+    .slice(0, 12);
 
   return (
     <div className="sidebar">
@@ -695,65 +631,125 @@ export default function TechHub() {
   const [activeSource, setActiveSource] = useState("all");
   const [failed, setFailed] = useState([]);
   const [visibleCount, setVisibleCount] = useState(24);
+  const [weekly, setWeekly] = useState(null);
 
-  const fetchAll = useCallback(async () => {
-    setSpinning(true);
-    const errs = [];
-    const results = await Promise.allSettled(
-      SOURCES.map(async (src) => {
-        let xmlText = null;
-        // Primary: codetabs
-        try {
-          xmlText = await fetchViaProxy(CODETABS, src.url);
-        } catch {
-          // Fallback 1: corsproxy
-          try {
-            xmlText = await fetchViaProxy(CORSPROXY, src.url);
-          } catch {
-            // Fallback 2: thingproxy
-            try {
-              xmlText = await fetchViaProxy(THINGPROXY, src.url);
-            } catch {
-              errs.push(src.label);
-              return [];
-            }
-          }
-        }
-        try {
-          if (src.isHtml && src.id === "anthropic") {
-            return parseAnthropicHTML(xmlText, src);
-          }
-          return parseRSSXML(xmlText, src);
-        } catch {
-          errs.push(src.label);
-          return [];
-        }
-      })
-    );
-    const all = results
-      .filter(r => r.status === "fulfilled")
-      .flatMap(r => r.value)
-      .filter(a => a.title)
-      .sort((a, b) => new Date(b.date) - new Date(a.date));
-    setArticles(all);
-    setFailed(errs);
-    setLoading(false);
-    setSpinning(false);
-    setVisibleCount(24); // reset on refresh
+  // Freshness state, all driven by the published file rather than by this tab.
+  const [generatedAt, setGeneratedAt] = useState(null);   // when the data was gathered
+  const [intervalMinutes, setIntervalMinutes] = useState(REFRESH_INTERVAL_MINUTES);
+  const [checking, setChecking] = useState(false);        // a re-check is in flight
+  const [loadError, setLoadError] = useState(null);
+  const [flash, setFlash] = useState(null);               // null | "new" | "current"
+  const [now, setNow] = useState(() => Date.now());
 
-    // Enqueue missing images
-    all.forEach(a => {
-      if (a.imageLoading && !IMAGE_CACHE.has(a.link) && !FETCH_QUEUE.some(q => q.link === a.link)) {
-        FETCH_QUEUE.push({ id: a.id, link: a.link });
-      }
-    });
+  const lastCheckedRef = useRef(0);
+  const generatedAtRef = useRef(null);
 
-    processImageCacheQueue((id, img) => {
-      setArticles(prev => prev.map(pa => pa.id === id ? { ...pa, image: img || pa.image, imageLoading: false } : pa));
-    });
+  // Ticking clock: keeps "32m ago" and the countdown honest without re-fetching.
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), CLOCK_TICK_MS);
+    return () => clearInterval(t);
   }, []);
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
+  // `manual` distinguishes a button press (reset paging, always show feedback)
+  // from a background poll (leave the reader's position alone).
+  const loadFeeds = useCallback(async ({ manual = false } = {}) => {
+    setChecking(true);
+    if (manual) setSpinning(true);
+    lastCheckedRef.current = Date.now();
+
+    try {
+      // Cache-bust so an open tab is not served the copy it already has.
+      const res = await fetch(`${FEEDS_URL}?t=${Date.now()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (!Array.isArray(data.articles)) throw new Error("malformed feed file");
+
+      const isFirstLoad = generatedAtRef.current === null;
+      const isNewer = data.generatedAt !== generatedAtRef.current;
+      generatedAtRef.current = data.generatedAt;
+
+      setGeneratedAt(data.generatedAt);
+      setIntervalMinutes(data.intervalMinutes || REFRESH_INTERVAL_MINUTES);
+      setFailed((data.failed || []).map(f => f.label || f));
+      setWeekly(data.weekly ?? null);
+      setLoadError(null);
+
+      if (isNewer) {
+        setArticles(data.articles);
+        // Only a manual refresh resets paging — a background poll must not
+        // yank someone back up the page while they are reading.
+        if (manual) setVisibleCount(24);
+        // The first load is not "news", it is just the page appearing.
+        if (!isFirstLoad) setFlash("new");
+      } else if (manual) {
+        setFlash("current");
+      }
+    } catch (err) {
+      // Readers get a plain sentence; the underlying reason (a 404, an HTML
+      // error page parsed as JSON, a dropped connection) goes to the console
+      // where it is actually useful.
+      console.warn("[acmedaily] feed load failed:", err);
+      setLoadError(true);
+    } finally {
+      setLoading(false);
+      setChecking(false);
+      setSpinning(false);
+    }
+  }, []);
+
+  useEffect(() => { loadFeeds(); }, [loadFeeds]);
+
+  // Clear the flash after its animation finishes.
+  useEffect(() => {
+    if (!flash) return;
+    const t = setTimeout(() => setFlash(null), 2500);
+    return () => clearTimeout(t);
+  }, [flash]);
+
+  // Background poll for a newer published build.
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (document.visibilityState === "visible") loadFeeds();
+    }, POLL_INTERVAL_MS);
+    return () => clearInterval(t);
+  }, [loadFeeds]);
+
+  // Re-check when the tab comes back to the foreground, or when the network
+  // returns — the two moments when what is on screen is most likely stale.
+  useEffect(() => {
+    const recheck = () => {
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - lastCheckedRef.current < FOCUS_RECHECK_AFTER_MS) return;
+      loadFeeds();
+    };
+    document.addEventListener("visibilitychange", recheck);
+    window.addEventListener("online", recheck);
+    return () => {
+      document.removeEventListener("visibilitychange", recheck);
+      window.removeEventListener("online", recheck);
+    };
+  }, [loadFeeds]);
+
+  // Derived freshness readout.
+  const freshness = useMemo(() => {
+    if (loadError) return { state: "error", label: "Update failed", detail: "Retrying shortly" };
+    if (!generatedAt) return { state: "loading", label: "Loading…", detail: "" };
+
+    const age = now - new Date(generatedAt).getTime();
+    const dueIn = intervalMinutes * 60000 - age;
+    const stale = age > STALE_AFTER_MINUTES * 60000;
+
+    return {
+      state: stale ? "stale" : "ok",
+      label: `Updated ${formatClock(generatedAt)}`,
+      detail: stale
+        ? `${formatDuration(age)} old`
+        : dueIn > 0
+          ? `Next in ${formatDuration(dueIn)}`
+          : "Next update due",
+      ageLabel: timeAgo(generatedAt, now),
+    };
+  }, [generatedAt, intervalMinutes, now, loadError]);
 
   // Handle Category/Source Changes - Reset pagination
   const handleCatChange = (catId) => {
@@ -792,18 +788,15 @@ export default function TechHub() {
   const pagedList = filtered.slice(0, visibleCount);
   const hasMore = visibleCount < filtered.length;
 
-  // Sources for current category
-  const stripSources = activeCat === "all" ? SOURCES : SOURCES.filter(s => s.cat === activeCat);
-
   // Per-category counts
   const catCounts = useMemo(() =>
     CATEGORIES.reduce((acc, c) => { acc[c.id] = articles.filter(a => a.catId === c.id).length; return acc; }, {}),
     [articles]);
 
   const hero = filtered[0];
-  const rest = filtered.slice(1);
-  const today = new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-  const todayCount = articles.filter(a => (Date.now() - new Date(a.date)) < 86400000).length;
+  const heroSrc = hero ? sourceOf(hero) : null;
+  const today = new Date(now).toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+  const todayCount = articles.filter(a => a.date && (now - new Date(a.date)) < 86400000).length;
 
   return (
     <>
@@ -812,12 +805,22 @@ export default function TechHub() {
 
         {/* Masthead */}
         <div className="masthead">
-          <div className="masthead-eye">Software Team · Tech Intelligence Feed</div>
-          <div className="masthead-title">ACME <em>AI Daily</em></div>
-          <div className="masthead-divider">
-            <div className="masthead-line" />
-            <div className="masthead-sub">AI · Microsoft · Cloud · DevOps · Enterprise · Security — Live</div>
-            <div className="masthead-line" />
+          <div className="masthead-inner">
+            <div className="masthead-eye">Software Team · Tech Intelligence Feed</div>
+            <div className="masthead-lockup">
+              <img
+                className="masthead-logo"
+                src={LOGO_URL}
+                width="605"
+                height="166"
+                alt="Almoayyed Computers Middle East"
+              />
+              <div className="masthead-rule" />
+              <div className="masthead-text">
+                <div className="masthead-title">ACME <em>AI Daily</em></div>
+                <div className="masthead-sub">AI · Microsoft · Cloud · DevOps · Enterprise · Security — Live</div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -862,11 +865,32 @@ export default function TechHub() {
             </div>
             <div className="nav-actions">
               <span className="date-stamp">{today}</span>
-              <button className={`refresh-btn ${spinning ? "spin" : ""}`} onClick={fetchAll}>
+
+              <div
+                className={`fresh is-${freshness.state}${checking ? " is-checking" : ""}`}
+                title={generatedAt
+                  ? `Feeds gathered ${new Date(generatedAt).toLocaleString()} (${freshness.ageLabel}). Rebuilt every ${intervalMinutes} minutes.`
+                  : "Loading published feeds…"}
+              >
+                <span className="fresh-main">
+                  <span className="fresh-pip" />
+                  {flash && !loadError
+                    ? <span className="fresh-flash">{flash === "new" ? "New articles" : "Up to date"}</span>
+                    : freshness.label}
+                </span>
+                {freshness.detail && <span className="fresh-next">{freshness.detail}</span>}
+              </div>
+
+              <button
+                className={`refresh-btn ${spinning ? "spin" : ""}`}
+                onClick={() => loadFeeds({ manual: true })}
+                disabled={checking}
+                aria-label="Check for newer articles"
+              >
                 <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                   <path d="M23 4v6h-6M1 20v-6h6" /><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
                 </svg>
-                Refresh
+                <span className="refresh-label">Refresh</span>
               </button>
             </div>
           </div>
@@ -880,8 +904,8 @@ export default function TechHub() {
               <div className="ticker-track">
                 {[...articles.slice(0, 14), ...articles.slice(0, 14)].map((a, i) => (
                   <span key={i} className="t-item">
-                    <span style={{ color: a.source.color, fontSize: 7 }}>●</span>
-                    <span style={{ color: "rgba(255,255,255,0.5)", fontSize: 8 }}>[{a.source.label}]</span>
+                    <span style={{ color: sourceOf(a).color, fontSize: 7 }}>●</span>
+                    <span style={{ color: "rgba(255,255,255,0.5)", fontSize: 8 }}>[{sourceOf(a).label}]</span>
                     {a.title.slice(0, 75)}{a.title.length > 75 ? "…" : ""}
                     <span className="t-sep">◆</span>
                   </span>
@@ -891,25 +915,69 @@ export default function TechHub() {
           </div>
         )}
 
-        {/* Power Platform Banner */}
-        <div className="pp-banner">
-          <div className="pp-inner">
-            {POWER_FEATURES.map(f => (
-              <div key={f.id} className="pp-card">
-                <div className="pp-icon" style={{ background: f.bg, color: f.color }}>{f.icon}</div>
-                <div className="pp-body">
-                  <div className="pp-badge">{f.badge}</div>
-                  <div className="pp-label">{f.label}</div>
-                  <div className="pp-desc">{f.desc}</div>
-                  <div className="pp-action" style={{ color: f.color }}>Configure →</div>
-                </div>
+        {/* AI Weekly Review */}
+        {weekly && (
+          <div className="wk">
+            <div className="wk-inner">
+              <div className="wk-top">
+                <span className="wk-eyebrow">
+                  <span className="wk-spark">✦</span> The Week in AI · ACME AI Agent
+                </span>
+                <span className="wk-meta">
+                  {weekly.sample && <span className="wk-sample">Sample — not generated</span>}
+                  {!weekly.sample && `${weekly.articleCount} articles · ${weekPeriod(weekly)}`}
+                </span>
               </div>
-            ))}
+
+              <div className="wk-headline">{weekly.headline}</div>
+              {weekly.intro && <div className="wk-intro">{weekly.intro}</div>}
+
+              {weekly.themes?.length > 0 && (
+                <div className="wk-themes">
+                  {weekly.themes.map((t, i) => (
+                    <div key={i} className="wk-theme">
+                      <span className="wk-num">{String(i + 1).padStart(2, "0")}</span>
+                      <div className="wk-theme-title">{t.title}</div>
+                      <div className="wk-theme-sum">{t.summary}</div>
+                      <div className="wk-links">
+                        {(t.articles || []).map(a => {
+                          const src = SOURCE_BY_ID[a.sourceId] ?? UNKNOWN_SOURCE;
+                          return (
+                            <a
+                              key={a.link}
+                              className="wk-link"
+                              href={a.link}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              <span className="wk-link-dot" style={{ background: src.color }} />
+                              <span className="wk-link-title">{a.title}</span>
+                            </a>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Content */}
         <div className="page">
+          {loadError && (
+            <div className="warn">
+              {articles.length > 0
+                ? "⚠ Could not fetch the latest feed — showing the last data this tab loaded"
+                : "⚠ Could not load the feed. The next scheduled update should restore it; check the browser console for details."}
+            </div>
+          )}
+          {!loadError && freshness.state === "stale" && (
+            <div className="warn">
+              ⚠ Feed data is {freshness.detail} — the scheduled update has not run as expected
+            </div>
+          )}
           {failed.length > 0 && (
             <div className="warn">⚠ Feeds unavailable: {failed.join(", ")} — other sources loading fine</div>
           )}
@@ -921,7 +989,9 @@ export default function TechHub() {
                 <span className="issue-l">{today}</span>
                 <span className="issue-r">
                   <span className="live-dot" />
-                  {loading ? "Fetching feeds…" : `${todayCount} new today · ${filtered.length} total articles`}
+                  {loading
+                    ? "Fetching feeds…"
+                    : `${todayCount} new today · ${filtered.length} shown${generatedAt ? ` · refreshed ${freshness.ageLabel}` : ""}`}
                 </span>
               </div>
 
@@ -948,19 +1018,17 @@ export default function TechHub() {
                     <div className="hero-img-container">
                       {hero.image ? (
                         <img className="hero-img" src={hero.image} alt="" onError={e => { e.target.style.display = "none"; }} />
-                      ) : hero.imageLoading ? (
-                        <div className="img-shimmer" />
                       ) : (
-                        <div className="hero-ph" style={{ background: hero.source.color }}>
+                        <div className="hero-ph" style={{ background: heroSrc.color }}>
                           <div className="ph-grid" />
-                          <div className="ph-logo" style={{ fontSize: 48 }}>{hero.source.logo}</div>
-                          <div className="ph-name" style={{ fontSize: 16 }}>{hero.source.label}</div>
+                          <div className="ph-logo" style={{ fontSize: 48 }}>{heroSrc.logo}</div>
+                          <div className="ph-name" style={{ fontSize: 16 }}>{heroSrc.label}</div>
                         </div>
                       )}
                     </div>
                     <div className="hero-content">
-                      <div className="hero-kicker" style={{ color: hero.source.color }}>
-                        <span>{hero.source.logo} {hero.source.label}</span>
+                      <div className="hero-kicker" style={{ color: heroSrc.color }}>
+                        <span>{heroSrc.logo} {heroSrc.label}</span>
                         <span className="h-kl" />
                         <span style={{ color: "var(--muted)" }}>
                           Top Story · {CATEGORIES.find(c => c.id === hero.catId)?.label}
@@ -969,9 +1037,9 @@ export default function TechHub() {
                       <div className="hero-title">{hero.title}</div>
                       {hero.desc && <div className="hero-excerpt">{hero.desc}</div>}
                       <div className="hero-meta">
-                        <span style={{ color: hero.source.color }}>● {hero.source.label}</span>
+                        <span style={{ color: heroSrc.color }}>● {heroSrc.label}</span>
                         <span className="m-sep">·</span>
-                        <span>{timeAgo(hero.date)}</span>
+                        <span>{timeAgo(hero.date, now)}</span>
                         <span className="m-sep">·</span>
                         <span>Read full story →</span>
                       </div>
@@ -1013,7 +1081,7 @@ export default function TechHub() {
               )}
             </div>
 
-            <Sidebar articles={articles} activeCat={activeCat} />
+            <Sidebar articles={articles} />
           </div>
         </div>
       </div>
@@ -1021,33 +1089,32 @@ export default function TechHub() {
   );
 
   function renderArticleCard(a) {
+    const src = sourceOf(a);
     return (
-      <a key={a.id} className="art-card" href={a.link} target="_blank" rel="noopener noreferrer" style={{ "--src-color": a.source.color }}>
+      <a key={a.id} className="art-card" href={a.link} target="_blank" rel="noopener noreferrer" style={{ "--src-color": src.color }}>
         <div className="art-thumbnail">
           {a.image ? (
-            <img className="art-img" src={a.image} alt="" onError={e => { e.target.style.display = "none"; }} />
-          ) : a.imageLoading ? (
-            <div className="img-shimmer" />
+            <img className="art-img" src={a.image} alt="" loading="lazy" onError={e => { e.target.style.display = "none"; }} />
           ) : (
-            <div className="art-ph" style={{ background: a.source.color }}>
+            <div className="art-ph" style={{ background: src.color }}>
               <div className="ph-grid" />
-              <div className="ph-logo">{a.source.logo}</div>
-              <div className="ph-name">{a.source.label}</div>
+              <div className="ph-logo">{src.logo}</div>
+              <div className="ph-name">{src.label}</div>
             </div>
           )}
           <span className="art-arr">↗</span>
         </div>
         <div className="art-body">
-          <div className="art-src" style={{ color: a.source.color }}>
-            <span className="a-dot" style={{ background: a.source.color }} />
-            {a.source.label}
+          <div className="art-src" style={{ color: src.color }}>
+            <span className="a-dot" style={{ background: src.color }} />
+            {src.label}
             <span style={{ color: "var(--muted)", marginLeft: 4, fontWeight: 400 }}>
               {CATEGORIES.find(c => c.id === a.catId)?.icon}
             </span>
           </div>
           <div className="art-title" title={a.title}>{a.title}</div>
           {a.desc && <div className="art-desc" title={a.desc}>{a.desc}</div>}
-          <div className="art-meta">{timeAgo(a.date)}</div>
+          <div className="art-meta">{timeAgo(a.date, now)}</div>
         </div>
       </a>
     );

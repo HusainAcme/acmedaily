@@ -1,0 +1,75 @@
+name: Fetch feeds and publish
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub queues scheduled runs on a best-effort basis and
+    # can delay them under load, which is why the UI treats data as stale only
+    # after 90 minutes rather than 30.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+# Never let two publishes race for the gh-pages branch. A scheduled run that
+# is superseded while queued is not worth finishing.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Carries two things between runs:
+      #   images.json  — scraped og:image results, so each run only looks at
+      #                  genuinely new articles instead of re-scraping everything.
+      #   archive.json — the rolling 21-day article archive plus the current
+      #                  weekly summary. This is what makes a *weekly* review
+      #                  possible: a publisher's RSS feed only carries its most
+      #                  recent items, so no single fetch sees a full week.
+      - name: Restore feed state
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: feed-state-${{ github.run_id }}
+          restore-keys: feed-state-
+
+      - run: npm ci
+
+      - name: Fetch feeds and refresh weekly summary
+        env:
+          # Optional. Without it the run still succeeds — it just publishes
+          # without a weekly summary rather than failing the build.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: npm run feeds
+
+      - name: Build
+        run: npm run build
+
+      - name: Publish to gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Tell Pages not to run Jekyll over the Vite output.
+          touch dist/.nojekyll
+          cd dist
+          git init -q
+          git checkout -q -b gh-pages
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Publish: feeds generated $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
